@@ -104,7 +104,9 @@ with tab2:
             f_asset = st.text_input("결제 수단", placeholder="카카오뱅크, 신용카드 등")
             f_memo = st.text_input("메모")
             
-            submit_btn = st.form_submit_form_button("내역 저장하기")
+            # 오류가 있었던 부분 수정 완료 (form 중복 제거)
+            submit_btn = st.form_submit_button("내역 저장하기")
+            
             if submit_btn:
                 # 지출인 경우 금액을 음수로 저장하는 규칙 처리
                 final_amount = -f_amount if f_type == "지출" else f_amount
