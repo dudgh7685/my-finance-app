@@ -3,9 +3,12 @@ import pandas as pd
 import plotly.express as px
 from datetime import datetime
 import io
+import re
 
-st.set_page_config(page_title="스마트 가계부 & 자산관리", page_icon="💰", layout="centered", initial_sidebar_state="collapsed")
-
+# ==========================================
+# [설정] 앱 기본 구성 및 스타일
+# ==========================================
+st.set_page_config(page_title="스마트 가계부 & 자산관리", page_icon="💰", layout="centered")
 st.markdown("""
     <style>
     .main .block-container { padding-top: 2rem; padding-bottom: 5rem; }
@@ -13,37 +16,74 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# 1. 초기 세션 데이터 설정
-if 'ledger_data' not in st.session_state:
-    st.session_state.ledger_data = pd.DataFrame(columns=['날짜', '시간', '타입', '대분류', '소분류', '내용', '금액', '화폐', '결제수단', '메모'])
-if 'user_info' not in st.session_state:
-    st.session_state.user_info = {"이름": "사용자", "신용점수": 0, "연령": 30}
-if 'investment_data' not in st.session_state:
-    st.session_state.investment_data = pd.DataFrame(columns=['투자상품종류', '금융사', '상품명', '투자원금', '평가금액', '수익률'])
-if 'insurance_data' not in st.session_state:
-    st.session_state.insurance_data = pd.DataFrame(columns=['금융사', '상품명', '상태', '납입금액'])
+# ==========================================
+# [원칙 3] 상태 관리(Session State) 완벽 통제
+# ==========================================
+def init_session_state():
+    if 'ledger_data' not in st.session_state:
+        st.session_state.ledger_data = pd.DataFrame(columns=['날짜', '시간', '타입', '대분류', '소분류', '내용', '금액', '결제수단'])
+    if 'user_info' not in st.session_state:
+        st.session_state.user_info = {"이름": "사용자", "신용점수": 0}
+    if 'investment_data' not in st.session_state:
+        st.session_state.investment_data = pd.DataFrame(columns=['투자상품종류', '금융사', '상품명', '투자원금', '평가금액', '수익률'])
+    if 'insurance_data' not in st.session_state:
+        st.session_state.insurance_data = pd.DataFrame(columns=['금융사', '상품명', '상태', '납입금액'])
+    if 'debug_mode' not in st.session_state:
+        st.session_state.debug_mode = False
+    if 'debug_logs' not in st.session_state:
+        st.session_state.debug_logs = {}
 
+init_session_state()
+
+# ==========================================
+# [원칙 1] 데이터 정제 (Cleansing) 함수
+# ==========================================
+def clean_dataframe(df):
+    """결측치, 숨은 공백, 특수기호 등을 방어적으로 처리하는 데이터 클렌징 함수"""
+    try:
+        # 완전히 비어있는 행과 열 제거
+        df = df.dropna(how='all').dropna(axis=1, how='all')
+        # 컬럼명의 줄바꿈 및 좌우 공백 제거
+        df.columns = [str(c).replace('\n', '').strip() for c in df.columns]
+        # 모든 데이터의 앞뒤 공백 제거 및 결측치를 빈 문자열로 안전하게 변환
+        df = df.fillna('').astype(str).map(lambda x: x.strip() if isinstance(x, str) else x)
+        return df
+    except Exception as e:
+        return df # 실패 시 원본 반환 (앱 다운 방지)
+
+def extract_numbers(val):
+    """문자열에 섞인 콤마, 원, % 등을 제거하고 순수 숫자로 변환"""
+    try:
+        if pd.isna(val) or str(val).strip() == '': return 0.0
+        cleaned = re.sub(r'[^\d\.\-]', '', str(val))
+        return float(cleaned) if cleaned else 0.0
+    except:
+        return 0.0
+
+# ==========================================
+# 화면 레이아웃 시작
+# ==========================================
 st.title("📱 개인 자산관리 웹앱")
 tab1, tab2, tab3, tab4 = st.tabs(["🏠 홈", "📝 내역", "📊 자산 및 신용", "🔄 데이터 연동"])
 
-# ==========================================
+# ------------------------------------------
 # TAB 1: 홈 / 대시보드
-# ==========================================
+# ------------------------------------------
 with tab1:
     st.subheader("이번 달 재정 요약")
     df = st.session_state.ledger_data.copy()
     
-    if not df.empty:
-        df['금액'] = pd.to_numeric(df['금액'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
-        df['날짜'] = pd.to_datetime(df['날짜'], errors='coerce')
-        df = df.dropna(subset=['날짜'])
+    if not df.empty and '날짜' in df.columns and '금액' in df.columns:
+        df['금액_num'] = df['금액'].apply(extract_numbers)
+        df['날짜_dt'] = pd.to_datetime(df['날짜'], errors='coerce')
+        df = df.dropna(subset=['날짜_dt']) # 날짜로 변환 불가능한 찌꺼기 데이터 방어
         
         if not df.empty:
-            df['연월'] = df['날짜'].dt.strftime('%Y-%m')
+            df['연월'] = df['날짜_dt'].dt.strftime('%Y-%m')
             month_df = df[df['연월'] == df['연월'].max()]
             
-            income = abs(month_df[month_df['타입'] == '수입']['금액'].sum())
-            expense = abs(month_df[month_df['타입'] == '지출']['금액'].sum())
+            income = abs(month_df[month_df['타입'] == '수입']['금액_num'].sum())
+            expense = abs(month_df[month_df['타입'] == '지출']['금액_num'].sum())
             balance = income - expense
             
             col1, col2 = st.columns(2)
@@ -52,147 +92,131 @@ with tab1:
             st.metric("당월 순현금흐름", f"{balance:,.0f} 원", f"{balance:,.0f} 원")
             
             expense_df = month_df[month_df['타입'] == '지출'].copy()
-            if not expense_df.empty:
+            if not expense_df.empty and '대분류' in expense_df.columns:
                 st.write("### 📂 카테고리별 지출 비율")
-                expense_df['절대값'] = expense_df['금액'].abs()
+                expense_df['절대값'] = expense_df['금액_num'].abs()
                 fig = px.pie(expense_df, values='절대값', names='대분류', hole=0.4)
                 fig.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=300)
                 st.plotly_chart(fig, use_container_width=True)
     else:
-        st.warning("데이터가 없습니다. '데이터 연동' 탭에서 파일을 먼저 등록해주세요.")
+        st.info("'데이터 연동' 탭에서 데이터를 먼저 구성해 주세요.")
 
-# ==========================================
-# TAB 2: 가계부 내역 관리
-# ==========================================
+# ------------------------------------------
+# TAB 2: 상세 내역
+# ------------------------------------------
 with tab2:
     st.subheader("상세 거래 내역")
     df_display = st.session_state.ledger_data.copy()
-    if not df_display.empty:
-        df_display['금액'] = pd.to_numeric(df_display['금액'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
-        df_display['날짜'] = pd.to_datetime(df_display['날짜'], errors='coerce')
-        df_display = df_display.dropna(subset=['날짜']).sort_values(by=['날짜', '시간'], ascending=False)
-        
-        filter_type = st.radio("보기 필터", ["전체", "지출", "수입", "이체"], horizontal=True)
-        if filter_type != "전체":
-            df_display = df_display[df_display['타입'] == filter_type]
-            
-        for _, row in df_display.iterrows():
-            amt_color = "red" if row['타입'] == "지출" else "blue" if row['타입'] == "수입" else "gray"
-            sign = "" if row['타입'] == "이체" else "-" if row['타입'] == "지출" else "+"
-            st.markdown(f"""
-            <div style="padding: 10px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between;">
-                <div><b style="font-size:14px;">{row['내용']}</b> <span style="font-size:11px; color:#888;">| {row['대분류']}</span><br>
-                <small style="color:#aaa;">{row['날짜'].strftime('%m-%d')} {row['시간']} · {row['결제수단']}</small></div>
-                <div style="text-align: right; align-self: center;">
-                <b style="color:{amt_color}; font-size:15px;">{sign}{abs(float(row['금액'])):,.0f}원</b></div>
-            </div>
-            """, unsafe_allow_html=True)
-    else:
-        st.info("표시할 거래 내역이 없습니다.")
-
-# ==========================================
-# TAB 3: 자산 및 신용 관리
-# ==========================================
-with tab3:
-    st.subheader("나의 신용 및 금융 자산")
-    u_info = st.session_state.user_info
-    if u_info['신용점수'] > 0:
-        st.markdown(f"""
-        <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 20px; border-radius: 12px; color: white; margin-bottom: 20px;">
-            <span style="font-size:14px; opacity:0.8;">KCB 신용점수</span>
-            <h2 style="margin: 5px 0 0 0; color:white;">{u_info['신용점수']} 점</h2>
-        </div>
-        """, unsafe_allow_html=True)
     
-    with st.expander("📈 투자 자산 현황", expanded=True):
-        inv_df = st.session_state.investment_data.copy()
-        if not inv_df.empty:
-            inv_df['투자원금'] = pd.to_numeric(inv_df['투자원금'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
-            inv_df['평가금액'] = pd.to_numeric(inv_df['평가금액'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
-            inv_df['수익률'] = pd.to_numeric(inv_df['수익률'].astype(str).str.replace('%', ''), errors='coerce').fillna(0)
-            
-            total_eval = inv_df['평가금액'].sum()
-            st.metric("총 투자 평가액", f"{total_eval:,.0f} 원")
-            
-            for _, row in inv_df.iterrows():
-                st.markdown(f"""
-                <div style="background-color:#fafafa; padding:12px; border-radius:8px; margin-bottom:8px; border-left:4px solid #4e73df;">
-                    <small style="color:#888;">{row['투자상품종류']} | {row['금융사']}</small><br><b>{row['상품명']}</b><br>
-                    <span style="font-size:13px;">원금: {float(row['투자원금']):,.0f}원 → 평가액: <b>{float(row['평가금액']):,.0f}원</b></span>
-                    <span style="color:{"red" if float(row['수익률'])>=0 else "blue"}; font-size:13px; float:right;"><b>{float(row['수익률']):+.2f}%</b></span>
-                </div>
-                """, unsafe_allow_html=True)
-        else:
-            st.info("등록된 투자 상품이 없습니다.")
-            
-    with st.expander("🛡️ 보장성 보험 가입 현황", expanded=False):
-        if not st.session_state.insurance_data.empty:
-            st.dataframe(st.session_state.insurance_data, use_container_width=True, hide_index=True)
-        else:
-            st.info("등록된 보험 내역이 없습니다.")
+    if not df_display.empty and '날짜' in df_display.columns:
+        df_display['금액_num'] = df_display['금액'].apply(extract_numbers)
+        df_display['날짜_dt'] = pd.to_datetime(df_display['날짜'], errors='coerce')
+        df_display = df_display.dropna(subset=['날짜_dt']).sort_values(by=['날짜_dt'], ascending=False)
+        
+        # 상위 50개만 렌더링 (모바일 속도 방어)
+        st.dataframe(df_display.drop(columns=['금액_num', '날짜_dt']).head(50), use_container_width=True)
+    else:
+        st.info("거래 내역이 없습니다.")
 
-# ==========================================
-# TAB 4: 데이터 연동 (버튼 방식 도입으로 무한루프 및 데이터 증발 완벽 해결)
-# ==========================================
+# ------------------------------------------
+# TAB 3: 자산 및 신용
+# ------------------------------------------
+with tab3:
+    st.subheader("자산 및 신용 현황")
+    if st.session_state.user_info['신용점수'] > 0:
+        st.success(f"현재 KCB 신용점수: **{st.session_state.user_info['신용점수']} 점**")
+    
+    col_inv, col_ins = st.columns(2)
+    with col_inv:
+        st.write("📈 **투자 자산**")
+        st.dataframe(st.session_state.investment_data, use_container_width=True)
+    with col_ins:
+        st.write("🛡️ **보험 현황**")
+        st.dataframe(st.session_state.insurance_data, use_container_width=True)
+
+# ------------------------------------------
+# TAB 4: 데이터 연동 (핵심 방어적 파서)
+# ------------------------------------------
 with tab4:
     st.subheader("데이터 연동 센터")
-    uploaded_file = st.file_uploader("가계부 내역 또는 뱅샐현황 CSV 파일 선택", type=["csv"])
     
-    # 파일을 올리고 사용자가 명시적으로 '적용' 버튼을 눌렀을 때만 처리함 (데이터 증발 방지)
+    # 엑셀 확장을 명시적으로 선언하여 application/... 에러 방지
+    uploaded_file = st.file_uploader("파일 업로드 (CSV, XLSX, XLSM)", type=["csv", "xlsx", "xlsm", "xls"])
+    
     if uploaded_file is not None:
-        if st.button("파일 분석 및 앱에 적용하기"):
-            filename = uploaded_file.name
-            
-            # 인코딩 자동 감지 및 변환
-            try: raw_text = uploaded_file.getvalue().decode('utf-8-sig')
-            except: raw_text = uploaded_file.getvalue().decode('cp949', errors='ignore')
+        if st.button("파일 분석 및 적용 (안전 모드)"):
+            file_ext = uploaded_file.name.split('.')[-1].lower()
+            success_count = 0
             
             try:
-                # [가계부 내역 분석]
-                if "내역" in filename or "가계부" in filename:
-                    new_df = pd.read_csv(io.StringIO(raw_text))
-                    if '날짜' in new_df.columns and '금액' in new_df.columns:
-                        st.session_state.ledger_data = new_df
-                        st.success(f"✅ 가계부 내역 적용 완료! (총 {len(new_df)}건)")
-                    else:
-                        st.error("가계부 형식이 맞지 않습니다.")
+                # [1] 확장자에 따른 안전한 파일 읽기 (try-except 방어)
+                st.session_state.debug_logs.clear()
                 
-                # [뱅샐 현황 분석] (투명 칸 밀림 현상 완벽 반영)
-                elif "현황" in filename or "뱅샐" in filename:
-                    lines = raw_text.split('\n')
-                    invest_rows, ins_rows = [], []
-                    
-                    for line in lines:
-                        # 콤마 단위로 쪼개고, 좌우 공백을 제거하여 리스트에 담음
-                        cols = [c.strip() for c in line.split(',')]
-                        
-                        # 데이터가 너무 짧은 줄은 무시
-                        if len(cols) < 6: continue
-                        
-                        # 1. 신용점수: cols[1]에 이름이 있거나, cols[2]에 성별이 있는 경우 cols[4]가 신용점수
-                        if cols[1] == '정성훈' or cols[2] in ['남', '여']:
-                            try: st.session_state.user_info["신용점수"] = int(cols[4])
-                            except: pass
-                            
-                        # 2. 투자상품: cols[1]이 주식, 채권 등일 때 지정된 순서대로 추출
-                        if cols[1] in ["주식", "펀드", "채권", "투자"]:
-                            invest_rows.append({
-                                '투자상품종류': cols[1], '금융사': cols[2], '상품명': cols[3],
-                                '투자원금': cols[5], '평가금액': cols[6], '수익률': cols[7]
-                            })
-                            
-                        # 3. 보험현황: cols[4]가 '정상'이고, cols[1]에 보험사 이름이 있을 때 추출
-                        if cols[4] == '정상' and ('보험' in cols[1] or '생명' in cols[1]):
-                            ins_rows.append({
-                                '금융사': cols[1], '상품명': cols[2], '상태': cols[4], '납입금액': cols[5]
-                            })
-                            
-                    if invest_rows: st.session_state.investment_data = pd.DataFrame(invest_rows)
-                    if ins_rows: st.session_state.insurance_data = pd.DataFrame(ins_rows)
-                    st.success("✅ 자산 현황(신용, 주식, 보험) 적용 완료!")
-                
+                if file_ext in ['xlsx', 'xlsm', 'xls']:
+                    try:
+                        # 엑셀 파일은 시트가 여러 개일 수 있으므로 딕셔너리로 전체 로드
+                        raw_data_dict = pd.read_excel(uploaded_file, sheet_name=None, engine='openpyxl')
+                    except Exception as e:
+                        st.error(f"엑셀 엔진 로드 실패 (openpyxl 설치 확인 필요): {e}")
+                        st.stop()
+                elif file_ext == 'csv':
+                    try: raw_df = pd.read_csv(uploaded_file, encoding='utf-8-sig')
+                    except: raw_df = pd.read_csv(uploaded_file, encoding='cp949', errors='ignore')
+                    raw_data_dict = {"CSV_Data": raw_df}
                 else:
-                    st.warning("파일 이름에 '내역'이나 '현황'이라는 단어가 포함되어 있어야 정상 분류됩니다.")
+                    st.error("지원하지 않는 포맷입니다.")
+                    st.stop()
+
+                # [2] 원칙 2: 추측 금지 -> 각 시트별 데이터 구조 스캔 및 매핑
+                for sheet_name, raw_df in raw_data_dict.items():
+                    df_clean = clean_dataframe(raw_df)
+                    
+                    # 로드된 데이터의 형태를 세션에 저장 (파싱 실패 시 디버깅용)
+                    st.session_state.debug_logs[sheet_name] = df_clean.head(15)
+                    
+                    # 헤더 탐색 방어 로직: 엑셀 위쪽에 쓰레기값이 있을 경우를 대비해 '날짜' 또는 '금액'이 있는 행을 헤더로 승격
+                    header_idx = -1
+                    for idx, row in df_clean.head(20).iterrows():
+                        row_strs = [str(x) for x in row.values]
+                        if '날짜' in row_strs or '금액' in row_strs or '투자상품종류' in row_strs:
+                            header_idx = idx
+                            break
+                    
+                    if header_idx != -1:
+                        df_clean.columns = df_clean.iloc[header_idx]
+                        df_clean = df_clean.iloc[header_idx+1:].reset_index(drop=True)
+                        df_clean.columns = [str(c).replace('\n', '').strip() for c in df_clean.columns]
+                    
+                    # 가계부 내역 시트 판단
+                    if '날짜' in df_clean.columns and '금액' in df_clean.columns:
+                        st.session_state.ledger_data = df_clean
+                        success_count += 1
+                        st.success(f"✅ '{sheet_name}' 시트 -> 가계부 내역으로 인식 성공!")
+                    
+                    # 투자 현황 시트 판단
+                    elif '투자상품종류' in df_clean.columns and '투자원금' in df_clean.columns:
+                        st.session_state.investment_data = df_clean
+                        success_count += 1
+                        st.success(f"✅ '{sheet_name}' 시트 -> 투자 자산으로 인식 성공!")
+                        
+                # [3] 원칙 2: 완벽 매핑이 안 되었을 경우 디버그 모드 활성화
+                if success_count == 0:
+                    st.session_state.debug_mode = True
+                    st.warning("⚠️ 자동 데이터 매핑에 실패했습니다. 엑셀 파일의 구조가 일반적이지 않습니다.")
+                else:
+                    st.session_state.debug_mode = False
                     
             except Exception as e:
-                st.error(f"오류가 발생했습니다: {e}")
+                st.error(f"데이터 처리 중 치명적 오류 발생: {e}")
+                st.session_state.debug_mode = True
+
+    # ------------------------------------------
+    # 원칙 2: 팩트 체크를 위한 디버그 뷰어 (자동 활성화)
+    # ------------------------------------------
+    if st.session_state.get('debug_mode', False) and st.session_state.get('debug_logs'):
+        st.error("🛑 **[엔지니어 진단 모드]** 아래 데이터 구조를 확인 후 저에게 알려주세요.")
+        st.markdown("엑셀 파일이 어떻게 생겼는지 파이썬이 읽어들인 실제 원본 데이터를 출력합니다. **이 화면의 표 일부를 텍스트로 복사해서 저에게 주시면 완벽한 커스텀 파싱 코드를 즉시 짜드립니다.**")
+        
+        for sheet, debug_df in st.session_state.debug_logs.items():
+            st.write(f"📂 **시트명: {sheet} (상위 15행)**")
+            st.dataframe(debug_df, use_container_width=True)
