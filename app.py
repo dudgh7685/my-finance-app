@@ -84,35 +84,62 @@ def get_current_cycle_label():
     return get_cycle_label(datetime.now())
 
 # ==========================================
-# [엔진 2] 범용 디코더
+# [엔진 2] 범용 디코더 (NUL Byte 에러 완벽 방어)
 # ==========================================
 def decode_file(uploaded_file):
+    """CSV의 인코딩 깨짐과 바이너리 찌꺼기(\x00)를 소독하는 디코더"""
     raw_bytes = uploaded_file.getvalue()
-    try: return raw_bytes.decode('utf-8-sig')
-    except: return raw_bytes.decode('cp949', errors='ignore')
+    try: 
+        text = raw_bytes.decode('utf-8-sig')
+    except: 
+        text = raw_bytes.decode('cp949', errors='ignore')
+    
+    # csv.Error: line contains NUL 방지를 위한 소독
+    return text.replace('\x00', '')
 
 # ==========================================
 # [엔진 3] 데이터 파서 (가계부 / 포트폴리오)
 # ==========================================
 def parse_2026_ledger_for_learning(uploaded_file):
-    """2026 가계부.csv 에서 오직 사용자의 매핑 패턴만 뽑아냅니다."""
-    text = decode_file(uploaded_file)
+    """2026 가계부에서 오직 사용자의 매핑 패턴만 뽑아냅니다. (Excel/CSV 자동 방어)"""
     rules = {}
+    file_ext = uploaded_file.name.split('.')[-1].lower()
     
-    reader = csv.reader(io.StringIO(text))
     date_pattern1 = re.compile(r'^\d{2}/\d{2}\(.*\)$') 
     date_pattern2 = re.compile(r'^\d{4}-\d{2}-\d{2}$') 
     
-    for row in reader:
-        row = [str(x).strip() for x in row]
-        for i, val in enumerate(row):
-            if date_pattern1.match(val) or date_pattern2.match(val):
-                if i + 3 < len(row):
-                    main_cat = row[i+1]
-                    content = row[i+3]
-                    if content and main_cat and main_cat not in ['미분류', 'nan', '']:
-                        rules[content] = main_cat
-                break
+    try:
+        # 사용자가 실수로 엑셀(.xlsx)을 올렸을 경우의 방어 로직
+        if file_ext in ['xlsx', 'xls']:
+            df = pd.read_excel(uploaded_file, engine='openpyxl', header=None)
+            for _, row in df.iterrows():
+                row_strs = [str(x).strip() if pd.notna(x) else '' for x in row.values]
+                for i, val in enumerate(row_strs):
+                    if date_pattern1.match(val) or date_pattern2.match(val):
+                        if i + 3 < len(row_strs):
+                            main_cat = row_strs[i+1]
+                            content = row_strs[i+3]
+                            if content and main_cat and main_cat not in ['미분류', 'nan', '', 'None']:
+                                rules[content] = main_cat
+                        break
+        # 정상적인 CSV 파일일 경우의 로직
+        else:
+            text = decode_file(uploaded_file)
+            reader = csv.reader(io.StringIO(text))
+            
+            for row in reader:
+                row = [str(x).strip() for x in row]
+                for i, val in enumerate(row):
+                    if date_pattern1.match(val) or date_pattern2.match(val):
+                        if i + 3 < len(row):
+                            main_cat = row[i+1]
+                            content = row[i+3]
+                            if content and main_cat and main_cat not in ['미분류', 'nan', '']:
+                                rules[content] = main_cat
+                        break
+    except Exception as e:
+        pass
+        
     return rules
 
 def parse_period_ledger(uploaded_file):
@@ -122,7 +149,8 @@ def parse_period_ledger(uploaded_file):
         if file_ext in ['xlsx', 'xls']:
             df = pd.read_excel(uploaded_file, engine='openpyxl')
         else:
-            df = pd.read_csv(io.StringIO(decode_file(uploaded_file)))
+            text = decode_file(uploaded_file)
+            df = pd.read_csv(io.StringIO(text))
             
         df.columns = df.columns.str.strip()
         col_map = {}
@@ -174,8 +202,14 @@ def apply_user_patterns(df, rules):
     return df, mapped_count
 
 def parse_portfolio_history(uploaded_file):
+    file_ext = uploaded_file.name.split('.')[-1].lower()
     try:
-        df = pd.read_csv(io.StringIO(decode_file(uploaded_file)))
+        if file_ext in ['xlsx', 'xls']:
+            df = pd.read_excel(uploaded_file, engine='openpyxl')
+        else:
+            text = decode_file(uploaded_file)
+            df = pd.read_csv(io.StringIO(text))
+            
         df.columns = df.columns.str.strip()
         if '날짜' in df.columns and '총 평가 금액' in df.columns:
             df['날짜'] = pd.to_datetime(df['날짜'], errors='coerce')
@@ -185,8 +219,14 @@ def parse_portfolio_history(uploaded_file):
     return pd.DataFrame()
 
 def parse_portfolio_assets(uploaded_file):
+    file_ext = uploaded_file.name.split('.')[-1].lower()
     try:
-        df = pd.read_csv(io.StringIO(decode_file(uploaded_file)), header=None).dropna(how='all')
+        if file_ext in ['xlsx', 'xls']:
+            df = pd.read_excel(uploaded_file, engine='openpyxl', header=None).dropna(how='all')
+        else:
+            text = decode_file(uploaded_file)
+            df = pd.read_csv(io.StringIO(text), header=None).dropna(how='all')
+            
         asset_names, eval_values = [], []
         for _, row in df.iterrows():
             row_strs = [str(x).strip() for x in row.values]
@@ -337,7 +377,7 @@ with tab3:
                         rules = parse_2026_ledger_for_learning(f)
                         st.session_state.learned_rules.update(rules)
                         file_flags['pattern'] = True
-                    elif "내역" in fname or "2025-06-21~2026-06-21.xlsx" in fname:
+                    elif "내역" in fname or "2025-06-21~2026-06-21" in fname:
                         f.seek(0)
                         raw_df = parse_period_ledger(f)
                         file_flags['raw'] = True
