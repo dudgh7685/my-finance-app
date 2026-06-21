@@ -321,4 +321,20 @@ with tab3:
                         if not df_ledger.empty:
                             if not st.session_state.ledger_data.empty:
                                 combined = pd.concat([st.session_state.ledger_data, df_ledger])
-                                combined = combined.drop_duplicates(subset=['날짜', '내용', '금액'], keep='last').
+                                combined = combined.drop_duplicates(subset=['날짜', '내용', '금액'], keep='last').reset_index(drop=True)
+                                st.session_state.ledger_data = combined
+                            else:
+                                st.session_state.ledger_data = df_ledger
+                            parsed_count['ledger'] += len(df_ledger)
+
+                # 결과 리포팅
+                msg_parts = []
+                if parsed_count['history']: msg_parts.append("📈 자산 성장 기록(History)")
+                if parsed_count['assets']: msg_parts.append("🍩 자산 비중(Stock List)")
+                if parsed_count['ledger'] > 0: msg_parts.append(f"📝 가계부 내역({parsed_count['ledger']}건)")
+                
+                if msg_parts:
+                    st.session_state.system_msg = f"🎯 **분석 완료!** 성공적으로 적용된 데이터: " + ", ".join(msg_parts)
+                    st.rerun()
+                else:
+                    st.error("🛑 업로드된 파일들에서 유효한 포트폴리오나 가계부 패턴을 찾지 못했습니다.")
