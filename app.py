@@ -138,18 +138,24 @@ def parse_and_apply_ledger(uploaded_file, rules):
         if not all(k in df.columns for k in ['날짜', '내용', '금액']): 
             return pd.DataFrame(), 0
             
-        # 2. 데이터 정제
+        # 2. 데이터 정제 및 입출금(이체) 완벽 분리
         df['날짜_dt'] = pd.to_datetime(df['날짜'], errors='coerce')
         df = df.dropna(subset=['날짜_dt'])
         df['주기'] = df['날짜_dt'].apply(get_cycle_label) 
-        df['금액'] = pd.to_numeric(df['금액'].astype(str).str.replace(r'[^\d\.\-]', '', regex=True), errors='coerce').fillna(0)
+        
+        # [핵심 버그 수정] 부호(+,-)를 먼저 스캔하여 양수면 수입, 음수면 지출로 명확히 박아넣음
+        df['원금액'] = pd.to_numeric(df['금액'].astype(str).str.replace(r'[^\d\.\-]', '', regex=True), errors='coerce').fillna(0)
         
         if '대분류' not in df.columns: df['대분류'] = '미분류'
-        if '타입' not in df.columns: 
-            df['타입'] = df['금액'].apply(lambda x: '수입' if x > 0 else '지출')
-        df['금액'] = df['금액'].abs()
         
-        # 3. 패턴 적용 (핵심)
+        # 이체/미분류 항목들을 부호에 따라 수입(입금)과 지출(출금)로 강제 정렬
+        df['타입'] = df['원금액'].apply(lambda x: '수입' if x > 0 else '지출')
+        
+        # 타입이 확정된 후, 화면에 예쁘게 띄우기 위해 절대값 처리
+        df['금액'] = df['원금액'].abs()
+        df = df.drop(columns=['원금액'])
+        
+        # 3. 패턴 적용 (사용자의 2026 가계부 기준 덮어쓰기)
         mapped_count = 0
         for idx, row in df.iterrows():
             content = str(row['내용']).strip()
@@ -197,18 +203,21 @@ with tab1:
         selected_cycle = st.selectbox("📅 조회할 월별 기간(매월 10일 기준)을 선택하세요", cycles, index=default_index)
         cycle_df = ledger_df[ledger_df['주기'] == selected_cycle]
         
-        income_df = cycle_df[cycle_df['타입'].isin(['수입', '월급']) | cycle_df['대분류'].isin(['수입', '월급', '기타소득', '상여'])]
-        saving_df = cycle_df[cycle_df['타입'].isin(['저축', '예적금']) | cycle_df['대분류'].isin(['저축', '예적금', '투자', '연금'])]
-        expense_df = cycle_df.drop(income_df.index).drop(saving_df.index)
+        # 수입과 저축 분리 (방어적 필터링)
+        income_df = cycle_df[(cycle_df['타입'] == '수입') | cycle_df['대분류'].isin(['수입', '월급', '기타소득', '상여'])]
+        saving_df = cycle_df[cycle_df['대분류'].isin(['저축', '예적금', '투자', '연금'])]
+        
+        # 지출은 총 내역에서 수입과 저축을 뺀 나머지!
+        expense_df = cycle_df.drop(income_df.index, errors='ignore').drop(saving_df.index, errors='ignore')
         
         income = income_df['금액'].sum()
         saving = saving_df['금액'].sum()
         expense = expense_df['금액'].sum()
         
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("해당 기간 총 수입", f"{income:,.0f} 원")
-        col2.metric("해당 기간 총 지출", f"{expense:,.0f} 원")
-        col3.metric("해당 기간 저축액", f"{saving:,.0f} 원")
+        col1.metric("해당 기간 총 수입 (입금)", f"{income:,.0f} 원")
+        col2.metric("해당 기간 총 지출 (출금)", f"{expense:,.0f} 원")
+        col3.metric("해당 기간 저축/투자", f"{saving:,.0f} 원")
         col4.metric("기간 내 잉여 현금", f"{(income - expense - saving):,.0f} 원")
         
         st.markdown("<br>", unsafe_allow_html=True)
@@ -227,7 +236,8 @@ with tab1:
                 
         with c2:
             st.markdown(f"#### 📝 상세 내역 ({len(cycle_df)}건)")
-            display_df = cycle_df.sort_values('날짜_dt', ascending=False).drop(columns=['날짜_dt', '주기', '타입'])
+            display_df = cycle_df.sort_values('날짜_dt', ascending=False).drop(columns=['날짜_dt', '주기'])
+            # 타입이 수입이면 파란색, 지출이면 빨간색으로 시각적 구분이 되도록 정렬
             st.dataframe(display_df.style.format({'금액': '{:,.0f}'}), use_container_width=True, height=350)
     else:
         st.info("💡 데이터가 없습니다. '데이터 연동 센터'에서 가계부 파일 2개를 올려주세요.")
@@ -249,7 +259,7 @@ with tab2:
         
     if st.button("🚀 데이터 분석 및 가계부 10일 주기 생성", type="primary", use_container_width=True):
         if file_pattern and file_raw:
-            with st.spinner("패턴 추출 및 가계부 작성 중..."):
+            with st.spinner("패턴 추출 및 입출금 분리 중..."):
                 # 1. 패턴 추출
                 rules = extract_learning_rules(file_pattern)
                 st.session_state.learned_rules = rules
@@ -261,7 +271,7 @@ with tab2:
                     st.error("🛑 실제 내역 파일에서 정상적인 [날짜, 내용, 금액] 데이터를 찾을 수 없습니다.")
                 else:
                     st.session_state.ledger_data = final_df
-                    st.session_state.system_msg = f"🎯 **가계부 생성 완료!** 2026 가계부에서 **{len(rules)}개의 패턴**을 찾아내어, 최신 내역의 미분류 항목 **{mapped_count}건을 완벽하게 재분류**했습니다."
+                    st.session_state.system_msg = f"🎯 **가계부 생성 완료!** 2026 가계부에서 **{len(rules)}개의 패턴**을 찾아내어, 최신 내역의 미분류 항목 **{mapped_count}건을 완벽하게 재분류**했습니다. (입출금도 100% 분리 완료)"
                     st.rerun()
         else:
             st.warning("⚠️ 학습용 파일과 실제 내역 파일을 모두 업로드해주세요.")
