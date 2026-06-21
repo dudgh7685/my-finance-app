@@ -40,8 +40,10 @@ USER_CUSTOM_RULES = {
 def init_session_state():
     if 'ledger_data' not in st.session_state:
         st.session_state.ledger_data = pd.DataFrame(columns=['날짜', '타입', '대분류', '소분류', '내용', '금액', '결제수단'])
-    if 'user_info' not in st.session_state:
-        st.session_state.user_info = {"이름": "사용자", "신용점수": 0}
+    if 'upload_success' not in st.session_state:
+        st.session_state.upload_success = False  # 새로고침 상태 통제용
+    if 'upload_msg' not in st.session_state:
+        st.session_state.upload_msg = ""
 init_session_state()
 
 # ==========================================
@@ -50,14 +52,13 @@ init_session_state()
 def safe_parse_date(date_str):
     try:
         if '(' in date_str:
-            md = date_str.split('(')[0] # '01/09(Fri)' -> '01/09'
+            md = date_str.split('(')[0]
             return pd.to_datetime(f"2026/{md}", format='%Y/%m/%d')
         return pd.to_datetime(date_str)
     except:
         return pd.NaT
 
 def scan_and_extract_csv(uploaded_file):
-    """빈칸이 난무하는 대시보드형 CSV에서 날짜 패턴을 추적하여 데이터를 낚아채는 스캐너"""
     raw_bytes = uploaded_file.getvalue()
     try: raw_text = raw_bytes.decode('utf-8-sig')
     except: raw_text = raw_bytes.decode('cp949', errors='ignore')
@@ -65,17 +66,14 @@ def scan_and_extract_csv(uploaded_file):
     reader = csv.reader(io.StringIO(raw_text))
     records = []
     
-    # 정규식 패턴: '01/09(Fri)' 또는 '2026-01-09' 같은 날짜 모양을 감지
     date_pattern = re.compile(r'^\d{2}/\d{2}\(.*\)$') 
     date_pattern2 = re.compile(r'^\d{4}-\d{2}-\d{2}$') 
     
     for cols in reader:
         cols = [str(c).strip() for c in cols]
-        
         for i, col in enumerate(cols):
-            # 스캔하다가 날짜 모양의 데이터를 발견하면!
             if date_pattern.match(col) or date_pattern2.match(col):
-                if i + 4 < len(cols): # 옆으로 데이터가 충분히 있는지 확인
+                if i + 4 < len(cols):
                     date_str = col
                     main_cat = cols[i+1]
                     sub_cat = cols[i+2]
@@ -84,13 +82,11 @@ def scan_and_extract_csv(uploaded_file):
                     asset_memo = cols[i+5] if i+5 < len(cols) else ""
                     t_type_raw = cols[i-1] if i > 0 else ""
                     
-                    # 금액 정제 (숫자와 점, 마이너스만 남김)
                     amt_clean = re.sub(r'[^\d\.\-]', '', amount_str)
                     if not amt_clean: continue
                     try: amt_float = float(amt_clean)
                     except: continue
                         
-                    # 타입 (수입/지출/저축) 자동 보정
                     if t_type_raw in ['고정지출', '변동지출']: t_type = '지출'
                     elif t_type_raw in ['수입', '저축', '지출']: t_type = t_type_raw
                     else:
@@ -107,7 +103,6 @@ def scan_and_extract_csv(uploaded_file):
                         '금액': amt_float,
                         '결제수단': asset_memo
                     })
-    
     return pd.DataFrame(records)
 
 def run_smart_categorization():
@@ -177,6 +172,13 @@ with tab2:
 
 with tab3:
     st.subheader("데이터 연동 센터")
+    
+    # 성공 메시지를 새로고침 후에도 안전하게 띄워주는 로직
+    if st.session_state.upload_success:
+        st.balloons()
+        st.success(st.session_state.upload_msg)
+        st.session_state.upload_success = False  # 한 번 보여주고 초기화
+        
     uploaded_file = st.file_uploader("PC에서 변환하신 '가계부.csv' 파일을 선택해 주세요.", type=["csv"])
     
     if uploaded_file is not None:
@@ -186,7 +188,9 @@ with tab3:
                 
                 if not parsed_df.empty:
                     st.session_state.ledger_data = parsed_df
-                    st.balloons()
-                    st.success(f"🎯 완벽합니다! 흩어진 표 안에서 총 **{len(parsed_df)}건의 실제 거래 내역**을 1초 만에 안전하게 추출했습니다. '🏠 홈 요약' 탭에서 차트를 확인해 보세요!")
+                    # 데이터 저장 성공 상태 기록
+                    st.session_state.upload_success = True
+                    st.session_state.upload_msg = f"🎯 완벽합니다! 총 {len(parsed_df)}건의 실제 거래 내역을 1초 만에 안전하게 추출했습니다. '🏠 홈 요약' 탭을 확인해 보세요!"
+                    st.rerun() # ★ 핵심: 데이터를 저장하자마자 화면을 강제로 갱신하여 빈 화면을 즉시 없앱니다!
                 else:
                     st.error("🛑 날짜 패턴을 찾지 못했습니다. 올바른 파일인지 확인해 주세요.")
