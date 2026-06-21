@@ -1,10 +1,12 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import io
 import re
 import csv
 from datetime import datetime
+from dateutil.relativedelta import relativedelta
 
 # ==========================================
 # [설정] 앱 기본 구성 및 모던 UI (Custom CSS)
@@ -43,13 +45,13 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # ==========================================
-# [원칙 3] 상태 관리(Session State) 통제
+# [상태 관리] Session State
 # ==========================================
 def init_session_state():
     if 'ledger_data' not in st.session_state:
         st.session_state.ledger_data = pd.DataFrame()
     if 'learned_rules' not in st.session_state:
-        st.session_state.learned_rules = {}
+        st.session_state.learned_rules = {}  # 오직 2026 가계부에서만 학습!
     if 'portfolio_history' not in st.session_state:
         st.session_state.portfolio_history = pd.DataFrame()
     if 'portfolio_assets' not in st.session_state:
@@ -59,10 +61,10 @@ def init_session_state():
 init_session_state()
 
 # ==========================================
-# [엔진 1] 10일 단위 월별 사이클 계산기
+# [엔진 1] 10일 사이클 계산기
 # ==========================================
 def get_cycle_label(dt):
-    """주어진 날짜가 속한 '10일 ~ 다음달 9일' 사이클을 계산합니다."""
+    """현재 달 10일 ~ 다음달 9일 사이클로 묶어줍니다."""
     if pd.isna(dt): return "미상"
     y, m, d = dt.year, dt.month, dt.day
     
@@ -77,44 +79,44 @@ def get_cycle_label(dt):
     
     return f"{start_y}년 {start_m}월 10일 ~ {end_y}년 {end_m}월 9일"
 
+def get_current_cycle_label():
+    """오늘 날짜 기준의 사이클 라벨 반환"""
+    return get_cycle_label(datetime.now())
+
 # ==========================================
-# [원칙 1] 방어적 데이터 파싱 및 학습 엔진
+# [엔진 2] 범용 디코더
 # ==========================================
 def decode_file(uploaded_file):
     raw_bytes = uploaded_file.getvalue()
     try: return raw_bytes.decode('utf-8-sig')
     except: return raw_bytes.decode('cp949', errors='ignore')
 
-def learn_patterns_from_custom_ledger(uploaded_file):
-    """사용자가 다듬은 2026 가계부.csv 에서 분류 패턴을 완벽히 흡수합니다."""
+# ==========================================
+# [엔진 3] 데이터 파서 (가계부 / 포트폴리오)
+# ==========================================
+def parse_2026_ledger_for_learning(uploaded_file):
+    """2026 가계부.csv 에서 오직 사용자의 매핑 패턴만 뽑아냅니다."""
     text = decode_file(uploaded_file)
     rules = {}
     
-    # 1. 정식 헤더가 살아있는지 검사
-    df = pd.read_csv(io.StringIO(text), on_bad_lines='skip')
-    content_col = next((c for c in df.columns if '내용' in c or '사용처' in c), None)
-    cat_col = next((c for c in df.columns if '대분류' in c or '카테고리' in c), None)
+    reader = csv.reader(io.StringIO(text))
+    date_pattern1 = re.compile(r'^\d{2}/\d{2}\(.*\)$') 
+    date_pattern2 = re.compile(r'^\d{4}-\d{2}-\d{2}$') 
     
-    if content_col and cat_col:
-        for _, row in df.iterrows():
-            c = str(row[content_col]).strip()
-            cat = str(row[cat_col]).strip()
-            if c and cat and cat not in ['미분류', 'nan', '']: rules[c] = cat
-    else:
-        # 2. 헤더마저 날아간 순수 데이터 형태라면 스캔 엔진 가동
-        reader = csv.reader(io.StringIO(text))
-        for row in reader:
-            row = [str(x).strip() for x in row]
-            for i, val in enumerate(row):
-                if re.match(r'^\d{2}/\d{2}', val) or re.match(r'^\d{4}-\d{2}-\d{2}', val):
-                    if i + 3 < len(row):
-                        cat = row[i+1]
-                        c = row[i+3]
-                        if c and cat and cat not in ['미분류', 'nan', '']: rules[c] = cat
+    for row in reader:
+        row = [str(x).strip() for x in row]
+        for i, val in enumerate(row):
+            if date_pattern1.match(val) or date_pattern2.match(val):
+                if i + 3 < len(row):
+                    main_cat = row[i+1]
+                    content = row[i+3]
+                    if content and main_cat and main_cat not in ['미분류', 'nan', '']:
+                        rules[content] = main_cat
+                break
     return rules
 
-def parse_raw_ledger(uploaded_file):
-    """기간이 명시된 최신 가계부 내역(엑셀/CSV) 파싱"""
+def parse_period_ledger(uploaded_file):
+    """기간이 명시된 최신 엑셀/CSV에서 거래 내역을 추출합니다."""
     file_ext = uploaded_file.name.split('.')[-1].lower()
     try:
         if file_ext in ['xlsx', 'xls']:
@@ -122,7 +124,6 @@ def parse_raw_ledger(uploaded_file):
         else:
             df = pd.read_csv(io.StringIO(decode_file(uploaded_file)))
             
-        # 컬럼 공백 제거 및 필수 컬럼 확인
         df.columns = df.columns.str.strip()
         col_map = {}
         for c in df.columns:
@@ -135,21 +136,24 @@ def parse_raw_ledger(uploaded_file):
         df = df.rename(columns=col_map)
         if not all(k in df.columns for k in ['날짜', '내용', '금액']): return pd.DataFrame()
         
-        # 데이터 정제
         df['날짜_dt'] = pd.to_datetime(df['날짜'], errors='coerce')
         df = df.dropna(subset=['날짜_dt'])
-        df['주기'] = df['날짜_dt'].apply(get_cycle_label) # 10일 사이클 라벨링
+        df['주기'] = df['날짜_dt'].apply(get_cycle_label) 
         df['금액'] = pd.to_numeric(df['금액'].astype(str).str.replace(r'[^\d\.\-]', '', regex=True), errors='coerce').fillna(0)
         
         if '대분류' not in df.columns: df['대분류'] = '미분류'
         if '타입' not in df.columns: 
             df['타입'] = df['금액'].apply(lambda x: '수입' if x > 0 else '지출')
             
+        # 모든 금액은 절대값으로 처리 (수입/지출은 타입으로 구분)
+        df['금액'] = df['금액'].abs()
+            
         return df[['날짜', '날짜_dt', '주기', '타입', '대분류', '내용', '금액']]
-    except Exception as e: return pd.DataFrame()
+    except Exception as e: 
+        return pd.DataFrame()
 
-def apply_learned_rules(df, rules):
-    """학습된 패턴을 기간 명시 데이터에 덮어씌웁니다."""
+def apply_user_patterns(df, rules):
+    """오직 2026 가계부.csv에서 배운 패턴으로만 빈칸을 채웁니다."""
     if df.empty: return df, 0
     mapped_count = 0
     for idx, row in df.iterrows():
@@ -157,13 +161,13 @@ def apply_learned_rules(df, rules):
         current_cat = str(row['대분류']).strip()
         
         if current_cat in ['미분류', 'nan', '', 'None']:
-            # 정확히 일치하거나 내용에 키워드가 포함되어 있으면 맵핑
             if content in rules:
                 df.at[idx, '대분류'] = rules[content]
                 mapped_count += 1
             else:
+                # 부분 일치 방어 로직
                 for rule_k, rule_v in rules.items():
-                    if len(rule_k) > 1 and rule_k in content:
+                    if len(rule_k) > 1 and (rule_k in content or content in rule_k):
                         df.at[idx, '대분류'] = rule_v
                         mapped_count += 1
                         break
@@ -197,40 +201,45 @@ def parse_portfolio_assets(uploaded_file):
     return pd.DataFrame()
 
 # ==========================================
-# 화면 레이아웃
+# 화면 레이아웃 구성
 # ==========================================
 st.title("💎 Smart Wealth & Ledger Dashboard")
-tab1, tab2, tab3 = st.tabs(["📝 10일 주기 통합 가계부", "📊 자산 포트폴리오", "⚙️ 데이터 융합 센터"])
+tab1, tab2, tab3 = st.tabs(["📝 월별 가계부 내역 (10일 주기)", "📊 자산 포트폴리오", "⚙️ 데이터 융합 센터"])
 
 if st.session_state.system_msg:
     st.success(st.session_state.system_msg)
     st.session_state.system_msg = None
 
 # ------------------------------------------
-# TAB 1: 📝 10일 주기 통합 가계부
+# TAB 1: 📝 월별 가계부 내역 (10일 주기)
 # ------------------------------------------
 with tab1:
     ledger_df = st.session_state.ledger_data.copy()
     
     if not ledger_df.empty:
-        st.markdown("### 📅 월별 가계부 요약 (10일 ~ 익월 9일)")
-        
-        # 1. 10일 단위 사이클 추출 및 현재 달 자동 포커스
+        # 사이클 정렬 및 현재 사이클 자동 포커스
         cycles = sorted(ledger_df['주기'].unique(), reverse=True)
-        current_cycle = get_cycle_label(datetime.now())
+        current_cycle = get_current_cycle_label()
         
-        # 만약 현재 날짜의 사이클이 데이터에 존재하면 그것을 기본값으로, 없으면 가장 최신 데이터를 기본값으로
+        # 현재 달이 데이터에 있으면 해당 인덱스, 없으면 0(가장 최신)
         default_index = cycles.index(current_cycle) if current_cycle in cycles else 0
         
-        selected_cycle = st.selectbox("조회할 월별 기간을 선택하세요", cycles, index=default_index)
+        st.markdown("### 📅 기간별 가계부 요약")
+        selected_cycle = st.selectbox("조회할 월별 기간(매월 10일 기준)을 선택하세요", cycles, index=default_index)
         
-        # 선택된 사이클의 데이터만 필터링
         cycle_df = ledger_df[ledger_df['주기'] == selected_cycle]
         
-        # 2. 요약 메트릭
-        income = abs(cycle_df[cycle_df['타입'].isin(['수입', '월급'])]['금액'].sum())
-        expense = abs(cycle_df[cycle_df['타입'].isin(['지출', '변동지출', '고정지출'])]['금액'].sum())
-        saving = abs(cycle_df[cycle_df['타입'].isin(['저축', '예적금'])]['금액'].sum())
+        # 수입, 지출, 저축 요약
+        # 타입이 모호할 경우, 사용자 2026 가계부 패턴에 맞춰 대분류 기반 추론 추가
+        income_df = cycle_df[cycle_df['타입'].isin(['수입', '월급']) | cycle_df['대분류'].isin(['수입', '월급', '기타소득', '상여'])]
+        saving_df = cycle_df[cycle_df['타입'].isin(['저축', '예적금']) | cycle_df['대분류'].isin(['저축', '예적금', '투자', '연금'])]
+        
+        # 지출은 수입/저축이 아닌 나머지 모두
+        expense_df = cycle_df.drop(income_df.index).drop(saving_df.index)
+        
+        income = income_df['금액'].sum()
+        saving = saving_df['금액'].sum()
+        expense = expense_df['금액'].sum()
         
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("해당 기간 총 수입", f"{income:,.0f} 원")
@@ -240,27 +249,24 @@ with tab1:
         
         st.markdown("<br>", unsafe_allow_html=True)
         
-        # 3. 차트 및 데이터 테이블
         c1, c2 = st.columns([1, 2])
         with c1:
-            st.markdown("#### 📂 지출 비중")
-            expense_df = cycle_df[cycle_df['타입'].isin(['지출', '변동지출', '고정지출'])].copy()
+            st.markdown("#### 📂 지출 비중 분석")
             if not expense_df.empty:
-                expense_df['절대값'] = expense_df['금액'].abs()
-                fig = px.pie(expense_df, values='절대값', names='대분류', hole=0.5,
+                fig = px.pie(expense_df, values='금액', names='대분류', hole=0.5,
                              color_discrete_sequence=px.colors.qualitative.Pastel)
                 fig.update_traces(textinfo='percent+label', textposition='inside')
                 fig.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=350, showlegend=False)
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("지출 내역이 없습니다.")
+                st.info("해당 기간의 지출 내역이 없습니다.")
                 
         with c2:
-            st.markdown("#### 📝 상세 내역")
-            display_df = cycle_df.sort_values('날짜_dt', ascending=False).drop(columns=['날짜_dt', '주기'])
+            st.markdown(f"#### 📝 상세 내역 ({len(cycle_df)}건)")
+            display_df = cycle_df.sort_values('날짜_dt', ascending=False).drop(columns=['날짜_dt', '주기', '타입'])
             st.dataframe(display_df.style.format({'금액': '{:,.0f}'}), use_container_width=True, height=350)
     else:
-        st.info("💡 가계부 데이터가 없습니다. '데이터 융합 센터' 탭에서 데이터를 연동해 주세요.")
+        st.info("💡 가계부 데이터가 없습니다. '⚙️ 데이터 융합 센터' 탭에서 데이터를 연동해 주세요.")
 
 # ------------------------------------------
 # TAB 2: 📊 자산 포트폴리오
@@ -274,7 +280,7 @@ with tab2:
         latest = hist_df.iloc[-1]
         
         cash = asset_df[asset_df['자산명'].str.contains('현금|예적금', na=False)]['평가금액'].sum()
-        invest = asset_df[asset_df['자산명'].str.contains('주식|채권|금', na=False)]['평가금액'].sum()
+        invest = asset_df[asset_df['자산명'].str.contains('주식|채권|금|펀드|SNP|나스닥|기타', na=False)]['평가금액'].sum()
         real_estate = asset_df[asset_df['자산명'].str.contains('보증금|청약', na=False)]['평가금액'].sum()
         
         m1, m2, m3, m4 = st.columns(4)
@@ -328,19 +334,19 @@ with tab3:
                         file_flags['assets'] = True
                     elif "2026 가계부" in fname:
                         f.seek(0)
-                        rules = learn_patterns_from_custom_ledger(f)
+                        rules = parse_2026_ledger_for_learning(f)
                         st.session_state.learned_rules.update(rules)
                         file_flags['pattern'] = True
-                    elif "내역" in fname:
+                    elif "내역" in fname or "2025-06-21~2026-06-21.xlsx" in fname:
                         f.seek(0)
-                        raw_df = parse_raw_ledger(f)
+                        raw_df = parse_period_ledger(f)
                         file_flags['raw'] = True
                 
-                # 2. 가계부 내역에 학습된 패턴 적용
+                # 2. 기간 명시 가계부 내역에 학습된 패턴(2026 가계부 기반) 적용
                 if not raw_df.empty:
-                    final_df, mapped_count = apply_learned_rules(raw_df, st.session_state.learned_rules)
+                    final_df, mapped_count = apply_user_patterns(raw_df, st.session_state.learned_rules)
                     st.session_state.ledger_data = final_df
-                    msg_ledger = f"📝 기간 명시 가계부 내역 {len(final_df)}건 적용 (미분류 {mapped_count}건 AI 맵핑)"
+                    msg_ledger = f"📝 기간 명시 가계부 내역 {len(final_df)}건 적용 (사용자 패턴으로 {mapped_count}건 맵핑)"
                 else:
                     msg_ledger = ""
 
@@ -348,7 +354,7 @@ with tab3:
                 msg_parts = []
                 if file_flags['history']: msg_parts.append("📈 자산성장(History)")
                 if file_flags['assets']: msg_parts.append("🍩 자산비중(Stock)")
-                if file_flags['pattern']: msg_parts.append(f"🧠 학습된 패턴({len(st.session_state.learned_rules)}개)")
+                if file_flags['pattern']: msg_parts.append(f"🧠 학습된 사용자 패턴({len(st.session_state.learned_rules)}개)")
                 if msg_ledger: msg_parts.append(msg_ledger)
                 
                 if msg_parts:
