@@ -17,8 +17,8 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # ==========================================
-# 🧠 [핵심] 사용자 맞춤형 영구 분류 사전
-# 텍스트로 주신 데이터를 완벽하게 분석하여 하드코딩했습니다.
+# 🧠 [영구 내장] 사용자 맞춤형 소비 분류 사전
+# 보내주신 정형 텍스트의 패턴을 완벽히 하드코딩하여 탑재했습니다.
 # ==========================================
 USER_CUSTOM_RULES = {
     '수입': ['국군재정단', '굿리치', '농협손보지급', '부모급여', '아동수당', '보험금'],
@@ -40,7 +40,7 @@ USER_CUSTOM_RULES = {
 # ==========================================
 def init_session_state():
     if 'ledger_data' not in st.session_state:
-        st.session_state.ledger_data = pd.DataFrame(columns=['날짜', '시간', '타입', '대분류', '소분류', '내용', '금액', '결제수단'])
+        st.session_state.ledger_data = pd.DataFrame(columns=['날짜', '타입', '대분류', '소분류', '내용', '금액', '결제수단'])
     if 'user_info' not in st.session_state:
         st.session_state.user_info = {"이름": "사용자", "신용점수": 0}
     if 'investment_data' not in st.session_state:
@@ -51,17 +51,8 @@ def init_session_state():
 init_session_state()
 
 # ==========================================
-# [원칙 1] 데이터 클렌징 및 매핑 로직
+# [원칙 1] 초정밀 수직 블록 파싱 모듈
 # ==========================================
-def clean_dataframe(df):
-    try:
-        df = df.dropna(how='all').dropna(axis=1, how='all')
-        df.columns = [str(c).replace('\n', '').strip() for c in df.columns]
-        df = df.fillna('').astype(str).map(lambda x: x.strip() if isinstance(x, str) else x)
-        return df
-    except:
-        return df
-
 def extract_numbers(val):
     try:
         if pd.isna(val) or str(val).strip() == '': return 0.0
@@ -70,40 +61,93 @@ def extract_numbers(val):
     except:
         return 0.0
 
+def parse_vertical_block_file(uploaded_file):
+    """수직으로 적재된 다중 카테고리 시트를 줄 단위로 정밀 분해하는 파서"""
+    file_name = uploaded_file.name
+    file_ext = file_name.split('.')[-1].lower()
+    
+    if file_ext in ['xlsx', 'xls', 'xlsm']:
+        df_raw = pd.read_excel(uploaded_file, sheet_name=0, engine='openpyxl')
+    else:
+        try: df_raw = pd.read_csv(uploaded_file, encoding='utf-8-sig')
+        except: df_raw = pd.read_csv(uploaded_file, encoding='cp949', errors='ignore')
+        
+    records = []
+    current_type = "지출" # 기본값
+    
+    for _, row in df_raw.iterrows():
+        # 데이터 정제 및 양끝 공백 제거
+        vals = [str(x).strip() if pd.notna(x) and str(x).strip().lower() != 'nan' else '' for x in row.values]
+        
+        # 완전히 비어있는 여백 행 패스
+        if all(x == '' for x in vals): continue
+        
+        # 왼쪽 여백 열 제거
+        while vals and vals[0] == '': 
+            vals = vals[1:]
+            
+        row_str = " ".join(vals)
+        
+        # 1. 섹션 헤더 블록 감지 (예: 수입 2,236,320원 block)
+        if 'block' in row_str or ('내역' in row_str and ('수입' in row_str or '저축' in row_str or '지출' in row_str)):
+            if '수입' in row_str: current_type = '수입'
+            elif '저축' in row_str: current_type = '저축'
+            elif '지출' in row_str: current_type = '지출'
+            continue
+            
+        # 2. 컬럼명 타이틀 행 패스
+        if '날짜' in vals: continue
+        
+        # 3. b열 인덱스 숫자 밀림 현상 방어 및 자동 보정
+        if len(vals) >= 5:
+            if '/' not in vals[0] and '-' not in vals[0] and ('/' in vals[1] or '-' in vals[1]):
+                vals = vals[1:] # 맨 앞 인덱스 열을 탈락시켜 정렬 맞춤
+                
+        # 4. 실제 데이터 파싱 추출
+        if len(vals) >= 5:
+            date_str = vals[0]
+            if '/' in date_str or '-' in date_str:
+                main_cat = vals[1]
+                sub_cat = vals[2]
+                content = vals[3]
+                amount = vals[4]
+                asset = vals[5] if len(vals) > 5 else ""
+                
+                # 상단 헤더 찌꺼기 2차 방어
+                if main_cat in ['대분류', 'nan', ''] or content in ['사용내역', '수입 내역', '저축 내역']:
+                    continue
+                    
+                records.append({
+                    '날짜': date_str,
+                    '타입': current_type,
+                    '대분류': main_cat if main_cat else '미분류',
+                    '소분류': sub_cat,
+                    '내용': content,
+                    '금액': amount,
+                    '결제수단': asset
+                })
+                
+    return pd.DataFrame(records)
+
 def run_smart_categorization():
     df = st.session_state.ledger_data
-    if df.empty or '내용' not in df.columns:
-        return 0
+    if df.empty or '내용' not in df.columns: return 0
     
     count = 0
-    # 대분류가 없거나 미분류인 항목 필터링
-    if '대분류' not in df.columns:
-        df['대분류'] = '미분류'
-        
     mask = df['대분류'].isna() | (df['대분류'] == '') | (df['대분류'].str.contains('미분류', na=False))
     
     for idx, row in df[mask].iterrows():
         content = str(row['내용']).strip()
-        
-        # 하드코딩된 규칙으로 분류
-        matched = False
         for category, keywords in USER_CUSTOM_RULES.items():
             if any(keyword in content for keyword in keywords):
                 df.at[idx, '대분류'] = category
                 count += 1
-                matched = True
                 break
-                
-        # 만약 '쿠팡'인데 못 찾았을 경우 기본 생활비로 방어
-        if not matched and '쿠팡' in content:
-            df.at[idx, '대분류'] = '생활/쇼핑'
-            count += 1
-            
     st.session_state.ledger_data = df
     return count
 
 # ==========================================
-# 화면 레이아웃 
+# 레이아웃 구성
 # ==========================================
 st.title("📱 스마트 자산관리 시스템")
 tab1, tab2, tab3, tab4 = st.tabs(["🏠 홈", "📝 상세 내역", "📊 자산 현황", "🔄 데이터 연동"])
@@ -113,23 +157,24 @@ with tab1:
     df = st.session_state.ledger_data.copy()
     if not df.empty and '날짜' in df.columns and '금액' in df.columns:
         df['금액_num'] = df['금액'].apply(extract_numbers)
-        df['날짜_dt'] = pd.to_datetime(df['날짜'], errors='coerce')
+        df['날짜_dt'] = pd.to_datetime(df['날짜'].str.split('(').str[0], format='%m/%d', errors='coerce')
         df = df.dropna(subset=['날짜_dt'])
+        
         if not df.empty:
-            df['연월'] = df['날짜_dt'].dt.strftime('%Y-%m')
-            month_df = df[df['연월'] == df['연월'].max()]
-            income = abs(month_df[month_df['타입'] == '수입']['금액_num'].sum()) if '타입' in month_df.columns else 0
-            expense = abs(month_df[month_df['타입'] == '지출']['금액_num'].sum()) if '타입' in month_df.columns else abs(month_df['금액_num'].sum())
-            balance = income - expense
+            income = abs(df[df['타입'] == '수입']['금액_num'].sum())
+            expense = abs(df[df['타입'] == '지출']['금액_num'].sum())
+            saving = abs(df[df['타입'] == '저축']['금액_num'].sum())
+            balance = income - expense - saving
             
-            col1, col2 = st.columns(2)
-            col1.metric("이번 달 총 수입", f"{income:,.0f} 원")
-            col2.metric("이번 달 총 지출", f"{expense:,.0f} 원", f"-{expense:,.0f} 원", delta_color="inverse")
-            st.metric("당월 순현금흐름", f"{balance:,.0f} 원", f"{balance:,.0f} 원")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("총 수입", f"{income:,.0f} 원")
+            col2.metric("총 지출", f"{expense:,.0f} 원")
+            col3.metric("총 저축", f"{saving:,.0f} 원")
+            st.metric("순현금 잔액", f"{balance:,.0f} 원")
             
-            if '대분류' in month_df.columns:
-                st.write("### 📂 지출 비율")
-                expense_df = month_df[month_df['금액_num'] < 0].copy() if '타입' not in month_df.columns else month_df[month_df['타입'] == '지출'].copy()
+            if '대분류' in df.columns:
+                st.write("### 📂 주요 지출 분포")
+                expense_df = df[df['타입'] == '지출'].copy()
                 if not expense_df.empty:
                     expense_df['절대값'] = expense_df['금액_num'].abs()
                     fig = px.pie(expense_df, values='절대값', names='대분류', hole=0.4)
@@ -141,73 +186,30 @@ with tab1:
 with tab2:
     st.subheader("상세 거래 내역")
     if not st.session_state.ledger_data.empty:
-        colA, colB = st.columns([3, 1])
-        with colA:
-            st.caption(f"🧠 사용자 맞춤형 AI 분류 엔진 가동 중")
-        with colB:
-            if st.button("🪄 자동 분류 실행"):
-                cnt = run_smart_categorization()
-                st.success(f"분류 완료! ({cnt}건 자동 적용)")
-
-    df_display = st.session_state.ledger_data.copy()
-    if not df_display.empty and '날짜' in df_display.columns:
-        df_display['금액_num'] = df_display['금액'].apply(extract_numbers)
-        df_display['날짜_dt'] = pd.to_datetime(df_display['날짜'], errors='coerce')
-        df_display = df_display.dropna(subset=['날짜_dt']).sort_values(by=['날짜_dt'], ascending=False)
-        st.dataframe(df_display.drop(columns=['금액_num', '날짜_dt']).head(100), use_container_width=True)
+        if st.button("🪄 미분류 항목 자동 매핑 실행"):
+            cnt = run_smart_categorization()
+            st.success(f"매핑 완료! 총 {cnt}건의 미분류 항목을 매칭했습니다.")
+            st.rerun()
+            
+    st.dataframe(st.session_state.ledger_data, use_container_width=True)
 
 with tab3:
-    st.subheader("자산 및 신용 현황")
-    if st.session_state.user_info['신용점수'] > 0:
-        st.success(f"현재 KCB 신용점수: **{st.session_state.user_info['신용점수']} 점**")
-    col_inv, col_ins = st.columns(2)
-    with col_inv:
-        st.write("📈 **투자 자산**")
-        st.dataframe(st.session_state.investment_data, use_container_width=True)
-    with col_ins:
-        st.write("🛡️ **보험 현황**")
-        st.dataframe(st.session_state.insurance_data, use_container_width=True)
+    st.subheader("자산 및 금융 현황")
+    st.info("체크카드 및 주거래 통장 연동 대기 중")
 
 with tab4:
     st.subheader("데이터 연동 센터")
-    st.info("💡 이미 분류 규칙이 내장되어 있습니다. 가계부 내역 파일(CSV)만 올려주시면 됩니다!")
-    
-    uploaded_file = st.file_uploader("가계부 내역 파일 업로드 (CSV, XLSX)", type=["csv", "xlsx", "xls"])
+    uploaded_file = st.file_uploader("가계부 내역 파일 업로드 (CSV, XLSX, XLSM)", type=["csv", "xlsx", "xlsm", "xls"])
     
     if uploaded_file is not None:
-        if st.button("파일 분석 및 적용"):
-            file_name = uploaded_file.name
-            file_ext = file_name.split('.')[-1].lower()
-            
-            try:
-                # 파일 로드
-                if file_ext in ['xlsx', 'xls']:
-                    # CSV 변환 없이 엑셀 파일을 올릴 경우, 안전하게 첫 시트만 읽음
-                    raw_df = pd.read_excel(uploaded_file, sheet_name=0, engine='openpyxl')
-                    raw_data_dict = {"Data": raw_df}
+        # 무조건 결과를 보여주는 직관적인 버튼 인터페이스
+        if st.button("🚀 파일 분석 및 적용하기"):
+            with st.spinner("엑셀 구조 정밀 해체 중..."):
+                parsed_df = parse_vertical_block_file(uploaded_file)
+                
+                if not parsed_df.empty:
+                    st.session_state.ledger_data = parsed_df
+                    st.balloons()
+                    st.success(f"🎯 분석 성공! 수직 구조 파일에서 {len(parsed_df)}개의 가계부 데이터를 안전하게 추출해 연동했습니다. '🏠 홈' 이나 '📝 상세 내역' 탭으로 가보세요!")
                 else:
-                    try: raw_df = pd.read_csv(uploaded_file, encoding='utf-8-sig')
-                    except: raw_df = pd.read_csv(uploaded_file, encoding='cp949', errors='ignore')
-                    raw_data_dict = {"CSV_Data": raw_df}
-
-                # 데이터 처리
-                for sheet_name, raw_df in raw_data_dict.items():
-                    df_clean = clean_dataframe(raw_df)
-                    header_idx = -1
-                    for idx, row in df_clean.head(20).iterrows():
-                        row_strs = [str(x) for x in row.values]
-                        if '날짜' in row_strs and '금액' in row_strs:
-                            header_idx = idx
-                            break
-                    
-                    if header_idx != -1:
-                        df_clean.columns = df_clean.iloc[header_idx]
-                        df_clean = df_clean.iloc[header_idx+1:].reset_index(drop=True)
-                        df_clean.columns = [str(c).replace('\n', '').strip() for c in df_clean.columns]
-                    
-                    if '날짜' in df_clean.columns and '금액' in df_clean.columns:
-                        st.session_state.ledger_data = df_clean
-                        st.success(f"✅ 거래 내역 {len(df_clean)}건 적용 완료! ('📝 상세 내역' 탭에서 [자동 분류 실행] 버튼을 눌러주세요)")
-
-            except Exception as e:
-                st.error(f"데이터 처리 중 오류 발생: {e}")
+                    st.error("🛑 파일 분석 실패: 업로드한 파일에서 유효한 날짜 및 금액 데이터 포맷을 찾을 수 없습니다. 파일 내용을 다시 확인해 주세요.")
