@@ -98,17 +98,29 @@ def parse_and_apply_ledger(uploaded_file, rules):
     file_ext = uploaded_file.name.split('.')[-1].lower()
     try:
         if file_ext in ['xlsx', 'xls']:
-            df = pd.read_excel(uploaded_file, engine='openpyxl')
+            # 다중 시트 엑셀 방어: '내역'이나 '거래'가 포함된 시트를 최우선으로 찾아 읽음
+            xls = pd.ExcelFile(uploaded_file, engine='openpyxl')
+            target_sheet = xls.sheet_names[0]
+            for s in xls.sheet_names:
+                if any(keyword in s for keyword in ['내역', '거래', '가계부']):
+                    target_sheet = s
+                    break
+            df = pd.read_excel(xls, sheet_name=target_sheet)
         else:
             text = decode_file(uploaded_file)
             df = pd.read_csv(io.StringIO(text))
             
-        # 1. 헤더 탐색 및 매핑
+        # 1. 헤더 탐색 및 매핑 (엄격하고 유연하게 확장)
         df.columns = [str(c).strip() for c in df.columns]
-        if '날짜' not in df.columns or '내용' not in df.columns:
-            for idx, row in df.iterrows():
+        
+        has_date = any('날짜' in c for c in df.columns)
+        has_content = any(k in c for c in df.columns for k in ['내용', '내역', '사용처', '가맹점'])
+        has_amount = any(k in c for c in df.columns for k in ['금액', '이용금액'])
+        
+        if not (has_date and has_content and has_amount):
+            for idx, row in df.head(30).iterrows():
                 row_strs = [str(x) for x in row.values]
-                if any('날짜' in s for s in row_strs) and any('금액' in s for s in row_strs):
+                if any('날짜' in s for s in row_strs) and any(k in s for s in row_strs for k in ['금액', '이용금액']):
                     df.columns = df.iloc[idx]
                     df = df.iloc[idx+1:].reset_index(drop=True)
                     break
@@ -117,7 +129,7 @@ def parse_and_apply_ledger(uploaded_file, rules):
         col_map = {}
         for c in df.columns:
             if any(k in c for k in ['날짜', '일시', '승인일']): col_map[c] = '날짜'
-            elif any(k in c for k in ['내용', '가맹점', '사용처']): col_map[c] = '내용'
+            elif any(k in c for k in ['내용', '내역', '가맹점', '사용처']): col_map[c] = '내용'
             elif any(k in c for k in ['금액', '이용금액']): col_map[c] = '금액'
             elif '대분류' in c: col_map[c] = '대분류'
             elif '타입' in c or '구분' in c: col_map[c] = '타입'
