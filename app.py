@@ -86,8 +86,13 @@ def decode_file(uploaded_file):
 
 def parse_portfolio_history(uploaded_file):
     """History.csv 파싱 (날짜, 총 평가 금액, 수익률 추출)"""
+    file_ext = uploaded_file.name.split('.')[-1].lower()
     try:
-        df = pd.read_csv(io.StringIO(decode_file(uploaded_file)))
+        if file_ext in ['xlsx', 'xls']:
+            df = pd.read_excel(uploaded_file, engine='openpyxl')
+        else:
+            df = pd.read_csv(io.StringIO(decode_file(uploaded_file)))
+            
         df.columns = df.columns.str.strip()
         if '날짜' in df.columns and '총 평가 금액' in df.columns:
             df['날짜'] = pd.to_datetime(df['날짜'], errors='coerce')
@@ -100,11 +105,15 @@ def parse_portfolio_history(uploaded_file):
 
 def parse_portfolio_assets(uploaded_file):
     """Stock List.csv 파싱 (자산군별 비중 및 금액 추출)"""
+    file_ext = uploaded_file.name.split('.')[-1].lower()
     try:
-        df = pd.read_csv(io.StringIO(decode_file(uploaded_file)), header=None)
+        if file_ext in ['xlsx', 'xls']:
+            df = pd.read_excel(uploaded_file, engine='openpyxl', header=None)
+        else:
+            df = pd.read_csv(io.StringIO(decode_file(uploaded_file)), header=None)
+            
         df = df.dropna(how='all').reset_index(drop=True)
         
-        # '총 매입 금액' 또는 '총 평가 금액' 행을 찾아 데이터 추출
         asset_names = []
         eval_values = []
         
@@ -129,16 +138,30 @@ def parse_portfolio_assets(uploaded_file):
     except: return pd.DataFrame()
 
 def parse_ledger_data(uploaded_file):
-    """가계부 내역 (수직 블록 및 일반 CSV 통합) 파서"""
-    raw_text = decode_file(uploaded_file)
-    reader = csv.reader(io.StringIO(raw_text))
-    records = []
+    """가계부 내역 (수직 블록 및 일반 엑셀/CSV 통합) 완벽 방어 파서"""
+    file_ext = uploaded_file.name.split('.')[-1].lower()
     
+    try:
+        # [방어 로직] 엑셀일 경우 openpyxl, CSV일 경우 pandas로 우선 안전하게 로드
+        if file_ext in ['xlsx', 'xls']:
+            df_raw = pd.read_excel(uploaded_file, engine='openpyxl', header=None)
+        else:
+            raw_text = decode_file(uploaded_file)
+            # CSV 모듈이 뻗지 않도록 혹시 모를 NUL byte 제거
+            raw_text = raw_text.replace('\x00', '') 
+            reader = csv.reader(io.StringIO(raw_text))
+            df_raw = pd.DataFrame(list(reader))
+    except Exception as e:
+        return pd.DataFrame()
+        
+    records = []
     date_pattern = re.compile(r'^\d{2}/\d{2}\(.*\)$') 
     date_pattern2 = re.compile(r'^\d{4}-\d{2}-\d{2}$') 
     
-    for cols in reader:
-        cols = [str(c).strip() for c in cols]
+    # DataFrame을 순회하며 날짜 패턴이 있는지 정밀 스캔
+    for _, row in df_raw.iterrows():
+        cols = [str(c).strip() if pd.notna(c) else '' for c in row.values]
+        
         for i, col in enumerate(cols):
             if date_pattern.match(col) or date_pattern2.match(col):
                 if i + 4 < len(cols):
@@ -168,6 +191,8 @@ def parse_ledger_data(uploaded_file):
                         '소분류': sub_cat, '내용': content_str, 
                         '금액': amt_float, '결제수단': asset_memo
                     })
+                    break # 이 줄에서 거래 내역을 찾았으면 다음 줄로 넘어감
+                    
     return pd.DataFrame(records)
 
 def apply_auto_categorization(df):
@@ -184,6 +209,16 @@ def apply_auto_categorization(df):
                 count += 1
                 break
     return count
+
+def safe_parse_date(date_str):
+    try:
+        date_str = str(date_str).strip()
+        if '(' in date_str:
+            md = date_str.split('(')[0]
+            return pd.to_datetime(f"{datetime.now().year}/{md}", format='%Y/%m/%d')
+        return pd.to_datetime(date_str)
+    except:
+        return pd.NaT
 
 # ==========================================
 # 화면 레이아웃
@@ -203,14 +238,12 @@ with tab1:
     asset_df = st.session_state.portfolio_assets
     
     if not hist_df.empty and not asset_df.empty:
-        # 1. 핵심 지표 (Metrics)
         latest_data = hist_df.iloc[-1]
         total_assets = latest_data['총 평가 금액']
         total_roi = latest_data['수익률'] * 100 if '수익률' in latest_data else 0
         
-        # 자산군별 요약
         cash_assets = asset_df[asset_df['자산명'].str.contains('현금|예적금', na=False)]['평가금액'].sum()
-        invest_assets = asset_df[asset_df['자산명'].str.contains('주식|채권|금', na=False)]['평가금액'].sum()
+        invest_assets = asset_df[asset_df['자산명'].str.contains('주식|채권|금|펀드', na=False)]['평가금액'].sum()
         real_estate = asset_df[asset_df['자산명'].str.contains('보증금|청약', na=False)]['평가금액'].sum()
         
         col1, col2, col3, col4 = st.columns(4)
@@ -221,7 +254,6 @@ with tab1:
         
         st.markdown("<br>", unsafe_allow_html=True)
         
-        # 2. 고급 시각화 차트
         c1, c2 = st.columns([2, 1])
         with c1:
             st.markdown("#### 📈 자산 성장 추세 (Net Worth Trend)")
@@ -231,8 +263,7 @@ with tab1:
             fig1.update_layout(
                 plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
                 margin=dict(l=0, r=0, t=20, b=0), height=350,
-                xaxis_title="", yaxis_title="총 자산(원)",
-                hovermode="x unified"
+                xaxis_title="", yaxis_title="총 자산(원)", hovermode="x unified"
             )
             fig1.update_yaxes(showgrid=True, gridcolor='#f1f5f9')
             st.plotly_chart(fig1, use_container_width=True)
@@ -263,7 +294,6 @@ with tab2:
                 st.session_state.system_msg = f"✅ 매핑 완료! {cnt}건의 미분류 항목이 성공적으로 분류되었습니다."
                 st.rerun()
                 
-        # 가계부 요약 메트릭
         income = abs(ledger_df[ledger_df['타입'] == '수입']['금액'].sum())
         expense = abs(ledger_df[ledger_df['타입'] == '지출']['금액'].sum())
         saving = abs(ledger_df[ledger_df['타입'] == '저축']['금액'].sum())
@@ -279,16 +309,19 @@ with tab2:
         if filter_type != "전체":
             ledger_df = ledger_df[ledger_df['타입'] == filter_type]
             
+        ledger_df['날짜_dt'] = ledger_df['날짜'].apply(safe_parse_date)
+        ledger_df = ledger_df.sort_values('날짜_dt', ascending=False).drop(columns=['날짜_dt'])    
+            
         st.dataframe(ledger_df.style.format({'금액': '{:,.0f}'}), use_container_width=True, height=400)
     else:
-        st.info("💡 거래 내역이 없습니다. 가계부 CSV 파일을 연동해주세요.")
+        st.info("💡 거래 내역이 없습니다. 가계부 엑셀 파일을 연동해주세요.")
 
 # ------------------------------------------
 # TAB 3: ⚙️ 데이터 연동 센터
 # ------------------------------------------
 with tab3:
     st.markdown("### 🔄 파일 다중 연동 센터")
-    st.write("보유하신 포트폴리오 CSV 파일들(History, Stock List)과 가계부 내역을 한 번에 드래그하여 업로드하세요. 시스템이 파일명을 인식하여 알맞은 위치에 자동 배치합니다.")
+    st.write("보유하신 포트폴리오 파일(History, Stock List)과 가계부 내역 엑셀/CSV를 한 번에 업로드하세요. 시스템이 파일명을 인식하여 알맞은 위치에 자동 배치합니다.")
     
     uploaded_files = st.file_uploader("파일 업로드 (여러 파일 동시 선택 가능)", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
     
@@ -309,12 +342,13 @@ with tab3:
                             
                     # 2. 포트폴리오 자산 비중 파싱
                     elif "stock list" in fname or "portfolio" in fname and "history" not in fname:
+                        f.seek(0)
                         df_assets = parse_portfolio_assets(f)
                         if not df_assets.empty:
                             st.session_state.portfolio_assets = df_assets
                             parsed_count['assets'] = True
                             
-                    # 3. 가계부 내역 파싱 (그 외 파일들 중 날짜/금액이 있는 경우)
+                    # 3. 가계부 내역 파싱
                     else:
                         f.seek(0)
                         df_ledger = parse_ledger_data(f)
@@ -327,7 +361,6 @@ with tab3:
                                 st.session_state.ledger_data = df_ledger
                             parsed_count['ledger'] += len(df_ledger)
 
-                # 결과 리포팅
                 msg_parts = []
                 if parsed_count['history']: msg_parts.append("📈 자산 성장 기록(History)")
                 if parsed_count['assets']: msg_parts.append("🍩 자산 비중(Stock List)")
@@ -337,4 +370,4 @@ with tab3:
                     st.session_state.system_msg = f"🎯 **분석 완료!** 성공적으로 적용된 데이터: " + ", ".join(msg_parts)
                     st.rerun()
                 else:
-                    st.error("🛑 업로드된 파일들에서 유효한 포트폴리오나 가계부 패턴을 찾지 못했습니다.")
+                    st.error("🛑 업로드된 엑셀/CSV 파일에서 유효한 포트폴리오나 가계부 데이터를 찾을 수 없습니다.")
